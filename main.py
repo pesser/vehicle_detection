@@ -273,7 +273,7 @@ class Transformer(sklearn.base.TransformerMixin):
 
 
     def transform(self, X):
-        t = Timer()
+        #t = Timer()
         X = features_colorspace(X, self.params["colorspace"])
         feature_list = list()
         feature_list.append(
@@ -283,7 +283,7 @@ class Transformer(sklearn.base.TransformerMixin):
         feature_list.append(
                 features_hog(X, self.params["hog_block_norm"], self.params["hog_transform_sqrt"], self.params["hog_channels"]))
         features = np.concatenate(feature_list, axis = 1)
-        print("Time to transform: {:.2f}".format(t.tock()))
+        #print("Time to transform: {:.2f}".format(t.tock()))
         return features
 
 
@@ -386,21 +386,27 @@ def extract_window(img, bbox):
 
 def detect(img, window_list, pipeline):
     """Classify all windows within img."""
-    t = Timer()
+    #t = Timer()
     windows = []
     for bbox in window_list:
         window = extract_window(img, bbox)
         windows.append(window)
     windows = np.stack(windows)
     detections = pipeline.predict(windows)
-    print("Time to detect: {:.2f}".format(t.tock()))
+    #print("Time to detect: {:.2f}".format(t.tock()))
     return detections
 
 
-def add_heat(heatmap, bboxes):
+def add_heat(heatmap, bboxes, amount):
     for bbox in bboxes:
         window = heatmap[bbox[0][1]:bbox[1][1], bbox[0][0]:bbox[1][0]]
-        window[window < 255] += 1
+        window[window < 256 - amount] += amount
+    return heatmap
+
+
+def cool_down(heatmap, amount):
+    heatmap[heatmap <= amount] = 0
+    heatmap[heatmap > amount] -= amount
     return heatmap
 
 
@@ -432,7 +438,7 @@ class VehicleTracking(object):
         self.window_list = get_multiscale_windows(self.sample_img)
         self.heatmap = np.zeros(self.sample_img.shape[:2], dtype = np.uint8)
 
-        self.decay = 0.999
+        self.decay = 0.0
         self.averaged_bboxes = []
 
 
@@ -442,22 +448,39 @@ class VehicleTracking(object):
 
         detections = detect(x, self.window_list, self.pipeline)
         detected_windows = [bbox for label, bbox in zip(detections, self.window_list) if label == 0]
-        for bbox in detected_windows:
-            cv2.rectangle(x, bbox[0], bbox[1], (0,255,0), 2)
 
-        add_heat(self.heatmap, detected_windows)
-        ths_heat(self.heatmap, 1)
-        heat_rgb = np.repeat(100*self.heatmap[:,:,None], 3, axis = 2)
+        amount = 255 // 15
+        add_heat(self.heatmap, detected_windows, amount)
+        cool_down(self.heatmap, amount)
+        ths_heatmap = np.array(self.heatmap)
+        ths_heatmap[ths_heatmap < 6*amount] = 0
+        heat_rgb = np.repeat(self.heatmap[:,:,None], 3, axis = 2)
         x = cv2.addWeighted(x, 0.5, heat_rgb, 0.5, 1.0)
 
-        labels, n_labels = scipy.ndimage.measurements.label(self.heatmap)
+        labels, n_labels = scipy.ndimage.measurements.label(ths_heatmap)
         detected_bboxes = list()
+        averaged_bboxes = list()
         for car_label in range(1, n_labels + 1):
             nonzero = (labels == car_label).nonzero()
             bbox = ((np.min(nonzero[1]), np.min(nonzero[0])),
                     (np.max(nonzero[1]), np.max(nonzero[0])))
             detected_bboxes.append(bbox)
+            subs = list()
+            for subbox in detected_windows:
+                if (
+                        bbox[0][0] <= subbox[0][0] and
+                        bbox[0][1] <= subbox[0][1] and
+                        bbox[1][0] >= subbox[1][0] and
+                        bbox[1][1] >= subbox[1][1]):
+                    subs.append(np.array(subbox))
+            if subs:
+                subs = np.stack(subs)
+                avgbox = np.int_(np.mean(subs, axis = 0))
+                avgbox = ((avgbox[0,0],avgbox[0,1]),(avgbox[1,0], avgbox[1,1]))
+                averaged_bboxes.append(avgbox)
 
+
+        """
         # match detected bounding boxes to known bounding boxes
         N_known = len(self.averaged_bboxes)
         N_new = len(detected_bboxes)
@@ -468,7 +491,7 @@ class VehicleTracking(object):
                         self.averaged_bboxes[i],
                         detected_bboxes[j])
         row_ind, col_ind = scipy.optimize.linear_sum_assignment(dmatrix)
-        print(dmatrix[row_ind, col_ind])
+        #print(dmatrix[row_ind, col_ind])
         mask = dmatrix[row_ind, col_ind] < 900
         matched_row_ind = row_ind[mask]
         matched_col_ind = col_ind[mask]
@@ -489,9 +512,17 @@ class VehicleTracking(object):
         for j in range(N_new):
             if not j in matched_col_ind:
                 self.averaged_bboxes.append(detected_bboxes[j])
+        """
+        
 
-        for bbox in self.averaged_bboxes:
-            cv2.rectangle(x, bbox[0], bbox[1], (0,0,255), 4)
+        for bbox in averaged_bboxes:
+            cv2.rectangle(x, bbox[0], bbox[1], (0,0,255), 6)
+
+        for bbox in detected_bboxes:
+            cv2.rectangle(x, bbox[0], bbox[1], (255,0,0), 4)
+
+        for bbox in detected_windows:
+            cv2.rectangle(x, bbox[0], bbox[1], (0,255,0), 2)
 
         # convert back to rgb again
         x = cv2.cvtColor(np.uint8(x), cv2.COLOR_BGR2RGB)
@@ -615,7 +646,7 @@ if __name__ == "__main__":
     for clip_fname in ["project_video.mp4"]:
         out_clip_fname = "out_" + clip_fname
         clip = moviepy.editor.VideoFileClip(clip_fname)
-        clip = clip.subclip(10,16)
+        #clip = clip.subclip(10,16)
         sample = clip.get_frame(0)
         tracker = VehicleTracking(pipeline, sample)
         out_clip = clip.fl_image(tracker)
