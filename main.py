@@ -8,6 +8,7 @@ import sklearn.svm
 import sklearn.pipeline
 import scipy.stats
 import skimage.feature
+import moviepy.editor
 
 # path where training data will be stored
 data_dir = os.path.join(os.getcwd(), "data")
@@ -153,6 +154,7 @@ def prepare_data(X, y, n = None):
 
 
 def features_colorspace(X, colorspace):
+    """Convert from BGR to desired colorspace."""
     if colorspace == "BGR":
         return X
 
@@ -178,6 +180,7 @@ def features_colorspace(X, colorspace):
 
 
 def features_spatial(X, size, channels):
+    """Extract features by resizing and flattening desired channels."""
     features = np.zeros((X.shape[0], size[0]*size[1]*len(channels)))
     for i in range(X.shape[0]):
         img = X[i,...][:,:,channels]
@@ -186,6 +189,7 @@ def features_spatial(X, size, channels):
 
 
 def features_hist(X, bins, channels):
+    """Extract features by calculating histograms over desired channels."""
     features = np.zeros((X.shape[0], bins*len(channels)))
     for i in range(X.shape[0]):
         channel_features = []
@@ -198,6 +202,7 @@ def features_hist(X, bins, channels):
 
 
 def features_hog(X, block_norm, transform_sqrt, channels):
+    """Extract features by computing HOG features with desired parameters."""
     orientations = 9
     pixels_per_cell = (8,8)
     cells_per_block = (3,3)
@@ -283,6 +288,8 @@ class Transformer(sklearn.base.TransformerMixin):
 
 
 class Timer(object):
+    """Simple timer class to find performance bottlenecks."""
+
     def __init__(self):
         self.tick()
 
@@ -302,6 +309,7 @@ def slide_window(
         img,
         x_start_stop=[None, None], y_start_stop=[None, None], 
         xy_window=(64, 64), xy_overlap=(0.5, 0.5)):
+    """Slide window over image and return all resulting bounding boxes."""
     # If x and/or y start/stop positions not defined, set to image size
     if not x_start_stop[0]:
         x_start_stop[0] = 0
@@ -333,7 +341,11 @@ def slide_window(
 
 
 def get_multiscale_windows(img):
-    window_list = slide_window(img,
+    """Return bounding boxes of windows of different scales slid over img
+    for likely vehicle positions."""
+    window_list = list()
+    """TODO add back full scales after development phase
+    window_list += slide_window(img,
             xy_overlap = (0.5, 0.5),
             x_start_stop = [620 - 6*64, 620 + 6*64],
             y_start_stop = [385, 385 + 2*64])
@@ -346,10 +358,23 @@ def get_multiscale_windows(img):
             xy_overlap = (0.75, 0.75),
             y_start_stop = [385, 385 + 2*128],
             xy_window = (128, 128))
+            """
+    window_list += slide_window(img,
+            xy_overlap = (0.75, 0.75),
+            x_start_stop = [620, 620 + 6*96],
+            y_start_stop = [385, 385 + 2*96],
+            xy_window = (96, 96))
+    window_list += slide_window(img,
+            xy_overlap = (0.75, 0.75),
+            x_start_stop = [620, None],
+            y_start_stop = [385, 385 + 2*128],
+            xy_window = (128, 128))
+    print("Number of windows: {}".format(len(window_list)))
     return window_list
 
 
 def extract_window(img, bbox):
+    """Extract patch from window and rescale to size used by classifier."""
     row_begin = bbox[0][1]
     row_end = bbox[1][1]
     col_begin = bbox[0][0]
@@ -360,6 +385,7 @@ def extract_window(img, bbox):
 
 
 def detect(img, window_list, pipeline):
+    """Classify all windows within img."""
     t = Timer()
     windows = []
     for bbox in window_list:
@@ -373,8 +399,103 @@ def detect(img, window_list, pipeline):
 
 def add_heat(heatmap, bboxes):
     for bbox in bboxes:
-        heatmap[bbox[0][1]:bbox[1][1], bbox[0][0]:bbox[1][0]] += 1
+        window = heatmap[bbox[0][1]:bbox[1][1], bbox[0][0]:bbox[1][0]]
+        window[window < 255] += 1
     return heatmap
+
+
+def ths_heat(heatmap, ths):
+    heatmap[heatmap <= ths] = 0
+    heatmap[heatmap > ths] = 1
+    return heatmap
+
+
+def midpoint(bbox):
+    return (0.5*(bbox[0][0] + bbox[1][0]), 0.5*(bbox[0][1] + bbox[1][1]))
+
+
+def bbox_dist(bbox1, bbox2):
+    d = 0.0
+    midpoint1 = midpoint(bbox1)
+    midpoint2 = midpoint(bbox2)
+    for i in range(2):
+        d += (midpoint1[i] - midpoint2[i])**2
+    return d
+
+
+class VehicleTracking(object):
+    """Vehicle detection pipeline."""
+
+    def __init__(self, clf_pipeline, sample_img):
+        self.pipeline = clf_pipeline
+        self.sample_img = sample_img
+        self.window_list = get_multiscale_windows(self.sample_img)
+        self.heatmap = np.zeros(self.sample_img.shape[:2], dtype = np.uint8)
+
+        self.decay = 0.999
+        self.averaged_bboxes = []
+
+
+    def __call__(self, x):
+        # convert from moviepy's rgb to opencv's bgr
+        x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+
+        detections = detect(x, self.window_list, self.pipeline)
+        detected_windows = [bbox for label, bbox in zip(detections, self.window_list) if label == 0]
+        for bbox in detected_windows:
+            cv2.rectangle(x, bbox[0], bbox[1], (0,255,0), 2)
+
+        add_heat(self.heatmap, detected_windows)
+        ths_heat(self.heatmap, 1)
+        heat_rgb = np.repeat(100*self.heatmap[:,:,None], 3, axis = 2)
+        x = cv2.addWeighted(x, 0.5, heat_rgb, 0.5, 1.0)
+
+        labels, n_labels = scipy.ndimage.measurements.label(self.heatmap)
+        detected_bboxes = list()
+        for car_label in range(1, n_labels + 1):
+            nonzero = (labels == car_label).nonzero()
+            bbox = ((np.min(nonzero[1]), np.min(nonzero[0])),
+                    (np.max(nonzero[1]), np.max(nonzero[0])))
+            detected_bboxes.append(bbox)
+
+        # match detected bounding boxes to known bounding boxes
+        N_known = len(self.averaged_bboxes)
+        N_new = len(detected_bboxes)
+        dmatrix = np.zeros((N_known, N_new))
+        for i in range(N_known):
+            for j in range(N_new):
+                dmatrix[i,j] = bbox_dist(
+                        self.averaged_bboxes[i],
+                        detected_bboxes[j])
+        row_ind, col_ind = scipy.optimize.linear_sum_assignment(dmatrix)
+        print(dmatrix[row_ind, col_ind])
+        mask = dmatrix[row_ind, col_ind] < 900
+        matched_row_ind = row_ind[mask]
+        matched_col_ind = col_ind[mask]
+        # update moving average 
+        for i, j in zip(matched_row_ind, matched_col_ind):
+            tlbr_tuple = [None, None]
+            for k in range(2):
+                xy_tuple = [None, None]
+                for l in range(2):
+                    xy_tuple[l] = int(
+                            self.decay * self.averaged_bboxes[i][k][l] +
+                            (1.0 - self.decay) * detected_bboxes[j][k][l])
+                tlbr_tuple[k] = tuple(xy_tuple)
+            self.averaged_bboxes[i] = tuple(tlbr_tuple)
+        # remove bounding boxes which are not present anymore
+        self.averaged_bboxes = [bbox for i, bbox in enumerate(self.averaged_bboxes) if i in matched_row_ind]
+        # add new bounding boxes
+        for j in range(N_new):
+            if not j in matched_col_ind:
+                self.averaged_bboxes.append(detected_bboxes[j])
+
+        for bbox in self.averaged_bboxes:
+            cv2.rectangle(x, bbox[0], bbox[1], (0,0,255), 4)
+
+        # convert back to rgb again
+        x = cv2.cvtColor(np.uint8(x), cv2.COLOR_BGR2RGB)
+        return x
 
 
 if __name__ == "__main__":
@@ -456,7 +577,7 @@ if __name__ == "__main__":
 
     print(pipeline.get_params())
 
-
+    """
     # sliding windows
     test_image_fnames = glob.glob("test_images/*.jpg")
     for img_fname in test_image_fnames:
@@ -487,3 +608,15 @@ if __name__ == "__main__":
                     (np.max(nonzero[1]), np.max(nonzero[0])))
             cv2.rectangle(out_img, bbox[0], bbox[1], (0,0,255), 8)
         cv2.imwrite(os.path.join(out_dir, "bounded_" + os.path.basename(img_fname)), out_img)
+    """
+
+
+    # evaluate on video
+    for clip_fname in ["project_video.mp4"]:
+        out_clip_fname = "out_" + clip_fname
+        clip = moviepy.editor.VideoFileClip(clip_fname)
+        clip = clip.subclip(10,16)
+        sample = clip.get_frame(0)
+        tracker = VehicleTracking(pipeline, sample)
+        out_clip = clip.fl_image(tracker)
+        out_clip.write_videofile(out_clip_fname, audio = False)
