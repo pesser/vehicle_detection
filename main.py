@@ -339,7 +339,7 @@ def get_multiscale_windows(img):
             y_start_stop = [385, 385 + 2*64])
     window_list += slide_window(img,
             xy_overlap = (0.75, 0.75),
-            x_start_stop = [620 - 5*96, 620 + 5*96],
+            x_start_stop = [620 - 6*96, 620 + 6*96],
             y_start_stop = [385, 385 + 2*96],
             xy_window = (96, 96))
     window_list += slide_window(img,
@@ -369,6 +369,12 @@ def detect(img, window_list, pipeline):
     detections = pipeline.predict(windows)
     print("Time to detect: {:.2f}".format(t.tock()))
     return detections
+
+
+def add_heat(heatmap, bboxes):
+    for bbox in bboxes:
+        heatmap[bbox[0][1]:bbox[1][1], bbox[0][0]:bbox[1][0]] += 1
+    return heatmap
 
 
 if __name__ == "__main__":
@@ -466,3 +472,18 @@ if __name__ == "__main__":
             if label == 0:
                 cv2.rectangle(out_img, bbox[0], bbox[1], (0,255,0), 6)
         cv2.imwrite(os.path.join(out_dir, "detected_" + os.path.basename(img_fname)), out_img)
+        detected_windows = [bbox for label, bbox in zip(detections, window_list) if label == 0]
+        heatmap = np.zeros(img.shape[:2])
+        add_heat(heatmap, detected_windows)
+        heatmap_vis = np.uint8(255 * heatmap / np.max(heatmap))
+        cv2.imwrite(os.path.join(out_dir, "heat_" + os.path.basename(img_fname)), heatmap_vis)
+        heatmap_ths = np.uint8(255 * (heatmap > 1))
+        cv2.imwrite(os.path.join(out_dir, "ths_" + os.path.basename(img_fname)), heatmap_ths)
+        labels, n_labels = scipy.ndimage.measurements.label(heatmap_ths)
+        print("{} cars found.".format(n_labels))
+        for car_label in range(1, n_labels + 1):
+            nonzero = (labels == car_label).nonzero()
+            bbox = ((np.min(nonzero[1]), np.min(nonzero[0])),
+                    (np.max(nonzero[1]), np.max(nonzero[0])))
+            cv2.rectangle(out_img, bbox[0], bbox[1], (0,0,255), 8)
+        cv2.imwrite(os.path.join(out_dir, "bounded_" + os.path.basename(img_fname)), out_img)
