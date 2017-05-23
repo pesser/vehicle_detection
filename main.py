@@ -153,6 +153,17 @@ def prepare_data(X, y, n = None):
     return (X_train, y_train), (X_test, y_test)
 
 
+def get_data(n = None):
+    """Get data in ready to use format. Parameter determines maximum number
+    of samples to return during development."""
+    files = download_data()
+    for path in files.values():
+        extract_data(path)
+    class_fnames, labelmap = explore_data()
+    X, y = load_data(class_fnames)
+    return prepare_data(X, y, n = n)
+
+
 def features_colorspace(X, colorspace):
     """Convert from BGR to desired colorspace."""
     if colorspace == "BGR":
@@ -215,6 +226,7 @@ def features_hog(X, block_norm, transform_sqrt, channels):
         n_blocks[i] = int((img_shape[i] - blocksize) / pixels_per_cell[i] + 1)
     n_hog_features = np.prod(n_blocks) * np.prod(cells_per_block) * orientations
 
+    # collect features over images and channels
     features = np.zeros((X.shape[0], n_hog_features*len(channels)))
     for i in range(X.shape[0]):
         channel_features = []
@@ -272,8 +284,10 @@ class Transformer(sklearn.base.TransformerMixin):
         return self
 
 
-    def transform(self, X):
-        #t = Timer()
+    def transform(self, X, verbose = False):
+        """Transform images to their features."""
+        if self.verbose:
+            t = Timer()
         X = features_colorspace(X, self.params["colorspace"])
         feature_list = list()
         feature_list.append(
@@ -283,7 +297,9 @@ class Transformer(sklearn.base.TransformerMixin):
         feature_list.append(
                 features_hog(X, self.params["hog_block_norm"], self.params["hog_transform_sqrt"], self.params["hog_channels"]))
         features = np.concatenate(feature_list, axis = 1)
-        #print("Time to transform: {:.2f}".format(t.tock()))
+        if self.verbose:
+            print("Number of features: {}".format(features.shape[1]))
+            print("Time to transform : {:.4e}".format(t.tock()/X.shape[0]))
         return features
 
 
@@ -344,32 +360,32 @@ def get_multiscale_windows(img):
     """Return bounding boxes of windows of different scales slid over img
     for likely vehicle positions."""
     window_list = list()
-    """TODO add back full scales after development phase
-    window_list += slide_window(img,
-            xy_overlap = (0.5, 0.5),
-            x_start_stop = [620 - 6*64, 620 + 6*64],
-            y_start_stop = [385, 385 + 2*64])
-    window_list += slide_window(img,
-            xy_overlap = (0.75, 0.75),
-            x_start_stop = [620 - 6*96, 620 + 6*96],
-            y_start_stop = [385, 385 + 2*96],
-            xy_window = (96, 96))
-    window_list += slide_window(img,
-            xy_overlap = (0.75, 0.75),
-            y_start_stop = [385, 385 + 2*128],
-            xy_window = (128, 128))
-            """
-    window_list += slide_window(img,
-            xy_overlap = (0.75, 0.75),
-            x_start_stop = [620, 620 + 6*96],
-            y_start_stop = [385, 385 + 2*96],
-            xy_window = (96, 96))
-    window_list += slide_window(img,
-            xy_overlap = (0.75, 0.75),
-            x_start_stop = [620, None],
-            y_start_stop = [385, 385 + 2*128],
-            xy_window = (128, 128))
-    print("Number of windows: {}".format(len(window_list)))
+    method = "right"
+    if method == "right":
+        # for the included video this is fine to improve speed
+        # but for other videos, method == "full" should be used
+        window_list += slide_window(img,
+                xy_overlap = (0.75, 0.75),
+                x_start_stop = [620, 620 + 6*96],
+                y_start_stop = [385, 385 + 2*96],
+                xy_window = (96, 96))
+        window_list += slide_window(img,
+                xy_overlap = (0.75, 0.75),
+                x_start_stop = [620, None],
+                y_start_stop = [385, 385 + 2*128],
+                xy_window = (128, 128))
+    elif method == "full":
+        window_list += slide_window(img,
+                xy_overlap = (0.75, 0.75),
+                x_start_stop = [620 - 6*96, 620 + 6*96],
+                y_start_stop = [385, 385 + 2*96],
+                xy_window = (96, 96))
+        window_list += slide_window(img,
+                xy_overlap = (0.75, 0.75),
+                y_start_stop = [385, 385 + 2*128],
+                xy_window = (128, 128))
+    else:
+        raise ValueError(method)
     return window_list
 
 
@@ -398,6 +414,8 @@ def detect(img, window_list, pipeline):
 
 
 def add_heat(heatmap, bboxes, amount):
+    """Add specified amount of heat within each bounding box and avoid
+    overflow."""
     for bbox in bboxes:
         window = heatmap[bbox[0][1]:bbox[1][1], bbox[0][0]:bbox[1][0]]
         window[window < 256 - amount] += amount
@@ -405,28 +423,37 @@ def add_heat(heatmap, bboxes, amount):
 
 
 def cool_down(heatmap, amount):
+    """Cool down complete heatmap by specified amount and avoid
+    underflow."""
     heatmap[heatmap <= amount] = 0
     heatmap[heatmap > amount] -= amount
     return heatmap
 
 
-def ths_heat(heatmap, ths):
-    heatmap[heatmap <= ths] = 0
-    heatmap[heatmap > ths] = 1
-    return heatmap
-
-
 def midpoint(bbox):
+    """Midpoint of bounding box."""
     return (0.5*(bbox[0][0] + bbox[1][0]), 0.5*(bbox[0][1] + bbox[1][1]))
 
 
 def bbox_dist(bbox1, bbox2):
+    """Euclidean distance of bounding boxes' midpoints."""
     d = 0.0
     midpoint1 = midpoint(bbox1)
     midpoint2 = midpoint(bbox2)
     for i in range(2):
         d += (midpoint1[i] - midpoint2[i])**2
+    d = np.sqrt(d)
     return d
+
+
+def update_bbox(prev, new, alpha):
+    """Exponential moving average applied to corners of bounding boxes."""
+    prev = np.array(prev)
+    new = np.array(new)
+    avg = alpha * new + (1.0 - alpha) * prev
+    avg = np.int_(avg)
+    avg_tuple = ((avg[0,0], avg[0,1]), (avg[1,0], avg[1,1]))
+    return avg_tuple
 
 
 class VehicleTracking(object):
@@ -438,50 +465,27 @@ class VehicleTracking(object):
         self.window_list = get_multiscale_windows(self.sample_img)
         self.heatmap = np.zeros(self.sample_img.shape[:2], dtype = np.uint8)
 
-        self.decay = 0.0
+        self.decay = 0.075          # lower values for smoother detections
+        self.centroid_radius = 60   # maximum distance in pixels between
+                                    # midpoints to consider them equal
         self.averaged_bboxes = []
 
+        self.verbose = 0            # display mode
 
-    def __call__(self, x):
-        # convert from moviepy's rgb to opencv's bgr
-        x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
 
-        detections = detect(x, self.window_list, self.pipeline)
-        detected_windows = [bbox for label, bbox in zip(detections, self.window_list) if label == 0]
-
-        amount = 255 // 15
-        add_heat(self.heatmap, detected_windows, amount)
-        cool_down(self.heatmap, amount)
-        ths_heatmap = np.array(self.heatmap)
-        ths_heatmap[ths_heatmap < 6*amount] = 0
-        heat_rgb = np.repeat(self.heatmap[:,:,None], 3, axis = 2)
-        x = cv2.addWeighted(x, 0.5, heat_rgb, 0.5, 1.0)
-
-        labels, n_labels = scipy.ndimage.measurements.label(ths_heatmap)
+    def update_bboxes(self, ths):
+        """Track bounding boxes given a thresholded heatmap."""
+        # find bboxes based on thresholded heatmap
+        labels, n_labels = scipy.ndimage.measurements.label(ths)
         detected_bboxes = list()
-        averaged_bboxes = list()
         for car_label in range(1, n_labels + 1):
             nonzero = (labels == car_label).nonzero()
             bbox = ((np.min(nonzero[1]), np.min(nonzero[0])),
                     (np.max(nonzero[1]), np.max(nonzero[0])))
             detected_bboxes.append(bbox)
-            subs = list()
-            for subbox in detected_windows:
-                if (
-                        bbox[0][0] <= subbox[0][0] and
-                        bbox[0][1] <= subbox[0][1] and
-                        bbox[1][0] >= subbox[1][0] and
-                        bbox[1][1] >= subbox[1][1]):
-                    subs.append(np.array(subbox))
-            if subs:
-                subs = np.stack(subs)
-                avgbox = np.int_(np.mean(subs, axis = 0))
-                avgbox = ((avgbox[0,0],avgbox[0,1]),(avgbox[1,0], avgbox[1,1]))
-                averaged_bboxes.append(avgbox)
+        self.detected_bboxes = detected_bboxes
 
-
-        """
-        # match detected bounding boxes to known bounding boxes
+        # match new and previous detections
         N_known = len(self.averaged_bboxes)
         N_new = len(detected_bboxes)
         dmatrix = np.zeros((N_known, N_new))
@@ -491,38 +495,75 @@ class VehicleTracking(object):
                         self.averaged_bboxes[i],
                         detected_bboxes[j])
         row_ind, col_ind = scipy.optimize.linear_sum_assignment(dmatrix)
-        #print(dmatrix[row_ind, col_ind])
-        mask = dmatrix[row_ind, col_ind] < 900
+        # only consider matches whose centroids are close
+        mask = dmatrix[row_ind, col_ind] < self.centroid_radius
         matched_row_ind = row_ind[mask]
         matched_col_ind = col_ind[mask]
         # update moving average 
         for i, j in zip(matched_row_ind, matched_col_ind):
-            tlbr_tuple = [None, None]
-            for k in range(2):
-                xy_tuple = [None, None]
-                for l in range(2):
-                    xy_tuple[l] = int(
-                            self.decay * self.averaged_bboxes[i][k][l] +
-                            (1.0 - self.decay) * detected_bboxes[j][k][l])
-                tlbr_tuple[k] = tuple(xy_tuple)
-            self.averaged_bboxes[i] = tuple(tlbr_tuple)
+            avg_bbox = self.averaged_bboxes[i]
+            new_bbox = detected_bboxes[j]
+            self.averaged_bboxes[i] = update_bbox(avg_bbox, new_bbox, self.decay)
+
         # remove bounding boxes which are not present anymore
         self.averaged_bboxes = [bbox for i, bbox in enumerate(self.averaged_bboxes) if i in matched_row_ind]
         # add new bounding boxes
         for j in range(N_new):
             if not j in matched_col_ind:
                 self.averaged_bboxes.append(detected_bboxes[j])
-        """
-        
 
-        for bbox in averaged_bboxes:
-            cv2.rectangle(x, bbox[0], bbox[1], (0,0,255), 6)
 
-        for bbox in detected_bboxes:
-            cv2.rectangle(x, bbox[0], bbox[1], (255,0,0), 4)
+    def __call__(self, x):
+        """Frame transformation."""
+        # convert from moviepy's rgb to opencv's bgr
+        x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
 
-        for bbox in detected_windows:
-            cv2.rectangle(x, bbox[0], bbox[1], (0,255,0), 2)
+        # run detection
+        detections = detect(x, self.window_list, self.pipeline)
+        detected_windows = [bbox for label, bbox in zip(detections, self.window_list) if label == 0]
+
+        # update heatmap
+        amount = 255 // 15
+        add_heat(self.heatmap, detected_windows, amount)
+        cool_down(self.heatmap, amount)
+
+        # update bounding boxes
+        ths_heatmap = np.array(self.heatmap)
+        ths_heatmap[ths_heatmap < 6*amount] = 0
+        self.update_bboxes(ths_heatmap)
+
+        if self.verbose:
+            # show heatmap
+            heat_rgb = np.repeat(self.heatmap[:,:,None], 3, axis = 2)
+            x = cv2.addWeighted(x, 0.5, heat_rgb, 0.5, 1.0)
+
+            # red for averaged boxes
+            for bbox in self.averaged_bboxes:
+                cv2.rectangle(x, bbox[0], bbox[1], (0,0,255), 6)
+
+            # blue for current, unsmoothened boxes
+            for bbox in self.detected_bboxes:
+                cv2.rectangle(x, bbox[0], bbox[1], (255,0,0), 4)
+
+            # green for all positive detections in current frame
+            for bbox in detected_windows:
+                cv2.rectangle(x, bbox[0], bbox[1], (0,255,0), 2)
+        else:
+            # picture in picture view of one detection
+            if self.averaged_bboxes:
+                i = 0
+                bbox = self.averaged_bboxes[i]
+                window = x[bbox[0][1]:bbox[1][1],bbox[0][0]:bbox[1][0],:]
+                margin = 50
+                x[margin:margin+window.shape[0],margin:margin+window.shape[1],:] = window
+                color = [0,0,0]
+                color[i%3] = 255
+                cv2.rectangle(x, (margin,margin), (margin+window.shape[1], margin + window.shape[0]), color, 4)
+            # all averaged bounding boxes
+            for i, bbox in enumerate(self.averaged_bboxes):
+                color = [0,0,0]
+                color[i%3] = 255
+                cv2.rectangle(x, bbox[0], bbox[1], color, 4)
 
         # convert back to rgb again
         x = cv2.cvtColor(np.uint8(x), cv2.COLOR_BGR2RGB)
@@ -531,19 +572,16 @@ class VehicleTracking(object):
 
 if __name__ == "__main__":
     np.random.seed(23) # for reproducibility
+    evaluate_model = True
 
     model_file = os.path.join(out_dir, "model.p")
     if not os.path.isfile(model_file):
-        max_data = 50
-        cv_searches = 1
+        # number of parameters to explore and cross validate - requires
+        # three times as many fits
+        cv_searches = 10
 
         # data
-        files = download_data()
-        for path in files.values():
-            extract_data(path)
-        class_fnames, labelmap = explore_data()
-        X, y = load_data(class_fnames)
-        (X_train, y_train), (X_test, y_test) = prepare_data(X, y, n = None)
+        (X_train, y_train), (X_test, y_test) = get_data(n = None)
 
         timer = Timer()
 
@@ -592,62 +630,70 @@ if __name__ == "__main__":
     with open(model_file, "rb") as f:
         pipeline = pickle.load(f)
 
-    if False:
-        # data
-        files = download_data()
-        for path in files.values():
-            extract_data(path)
-        class_fnames, labelmap = explore_data()
-        X, y = load_data(class_fnames)
-        (X_train, y_train), (X_test, y_test) = prepare_data(X, y, n = None)
-
-        # testing
+    if evaluate_model:
+        (X_train, y_train), (X_test, y_test) = get_data(n = None)
+        pipeline.steps[0][1].verbose = True
+        t = Timer()
         test_acc = pipeline.score(X_test, y_test)
-
+        print("Time to predict   : {:.4e}".format(t.tock()/X_test.shape[0]))
+        pipeline.steps[0][1].verbose = False
         print("Test accuracy  : {:.4f} [fraction]".format(test_acc))
 
-    print(pipeline.get_params())
+    # print parameters of model
+    params = pipeline.get_params()
+    param_keys = sorted([key for key in params.keys()
+            if any(key.startswith(component) for component in ["svc__C", "svc__kernel", "transformer__"])])
+    param_values = [params[k] for k in param_keys]
+    print(table_format(["parameter", "value"], width = 33, header = True))
+    for p, v in zip(param_keys, param_values):
+        print(table_format([p,v], width = 33))
 
-    """
-    # sliding windows
+    # image pipeline
     test_image_fnames = glob.glob("test_images/*.jpg")
     for img_fname in test_image_fnames:
+        # load image
         img = cv2.imread(img_fname)
         window_list = get_multiscale_windows(img)
         # visualize windows to be searched for cars
         out_img = np.array(img)
         for bbox in window_list:
             cv2.rectangle(out_img, bbox[0], bbox[1], (200,0,0), 1)
+        # run detections on all windows
         detections = detect(img, window_list, pipeline)
-        # visualize detected cars
-        for label, bbox in zip(detections, window_list):
-            if label == 0:
-                cv2.rectangle(out_img, bbox[0], bbox[1], (0,255,0), 6)
-        cv2.imwrite(os.path.join(out_dir, "detected_" + os.path.basename(img_fname)), out_img)
         detected_windows = [bbox for label, bbox in zip(detections, window_list) if label == 0]
+        # visualize detected windows
+        for bbox in detected_windows:
+            cv2.rectangle(out_img, bbox[0], bbox[1], (0,255,0), 6)
+        cv2.imwrite(os.path.join(out_dir, "detected_" + os.path.basename(img_fname)), out_img)
+        # create a heatmap based on detections
         heatmap = np.zeros(img.shape[:2])
-        add_heat(heatmap, detected_windows)
+        add_heat(heatmap, detected_windows, 1)
         heatmap_vis = np.uint8(255 * heatmap / np.max(heatmap))
         cv2.imwrite(os.path.join(out_dir, "heat_" + os.path.basename(img_fname)), heatmap_vis)
+        # thresholded heatmap for increased robustness
         heatmap_ths = np.uint8(255 * (heatmap > 1))
         cv2.imwrite(os.path.join(out_dir, "ths_" + os.path.basename(img_fname)), heatmap_ths)
+        # extract bounding boxes
         labels, n_labels = scipy.ndimage.measurements.label(heatmap_ths)
-        print("{} cars found.".format(n_labels))
+        print("{}: {} cars found.".format(img_fname, n_labels))
         for car_label in range(1, n_labels + 1):
             nonzero = (labels == car_label).nonzero()
             bbox = ((np.min(nonzero[1]), np.min(nonzero[0])),
                     (np.max(nonzero[1]), np.max(nonzero[0])))
             cv2.rectangle(out_img, bbox[0], bbox[1], (0,0,255), 8)
         cv2.imwrite(os.path.join(out_dir, "bounded_" + os.path.basename(img_fname)), out_img)
-    """
+    print("Number of windows: {}".format(len(window_list)))
 
-
-    # evaluate on video
-    for clip_fname in ["project_video.mp4"]:
-        out_clip_fname = "out_" + clip_fname
-        clip = moviepy.editor.VideoFileClip(clip_fname)
-        #clip = clip.subclip(10,16)
-        sample = clip.get_frame(0)
-        tracker = VehicleTracking(pipeline, sample)
-        out_clip = clip.fl_image(tracker)
-        out_clip.write_videofile(out_clip_fname, audio = False)
+    # video pipeline
+    for verbose in [True, False]:
+        for clip_fname in ["project_video.mp4"]:
+            out_clip_fname = "out_"
+            if verbose:
+                out_clip_fname += "verbose_"
+            out_clip_fname += clip_fname
+            clip = moviepy.editor.VideoFileClip(clip_fname)
+            sample = clip.get_frame(0)
+            tracker = VehicleTracking(pipeline, sample)
+            tracker.verbose = verbose
+            out_clip = clip.fl_image(tracker)
+            out_clip.write_videofile(os.path.join(out_dir, out_clip_fname), audio = False)
